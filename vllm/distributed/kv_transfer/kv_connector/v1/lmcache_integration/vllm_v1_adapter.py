@@ -1427,3 +1427,14 @@ class LMCacheConnectorV1Impl:
             }
 
         return False, return_params
+
+    @_lmcache_nvtx_annotate
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        flattened_block_ids = [
+            block_id for group_block_ids in block_ids for block_id in group_block_ids
+        ]
+        return self.request_finished(request, flattened_block_ids)

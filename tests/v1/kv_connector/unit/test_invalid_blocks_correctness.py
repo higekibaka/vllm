@@ -293,6 +293,86 @@ def test_sync_fail_invalid_blocks_evicted(fail_scheduler: Scheduler):
     assert conn_stats.hits == num_external_computed_tokens
 
 
+def test_grouped_invalid_blocks_truncate_from_earliest_group():
+    """Hybrid/grouped KV requests should truncate from the earliest bad group."""
+
+    class DummyRequest:
+        def __init__(self):
+            self.request_id = "req-grouped"
+            self.num_computed_tokens = 96
+            self.num_external_computed_tokens = 96
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.kv_cache_config = Mock()
+    scheduler.kv_cache_config.kv_cache_groups = (
+        Mock(kv_cache_spec=Mock(block_size=16)),
+        Mock(kv_cache_spec=Mock(block_size=16)),
+    )
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [10, 11, 12, 13, 14, 15],
+        [20, 21, 22, 23, 24, 25],
+    )
+
+    request = DummyRequest()
+    affected_req_ids, total_affected_tokens, blocks_to_evict = (
+        Scheduler._update_requests_with_invalid_blocks(
+            scheduler,
+            [request],
+            {13, 24},
+            {},
+            evict_blocks=True,
+        )
+    )
+
+    assert affected_req_ids == {"req-grouped"}
+    assert request.num_computed_tokens == 48
+    assert request.num_external_computed_tokens == 48
+    assert total_affected_tokens == 48
+    assert blocks_to_evict == {13, 14, 15, 23, 24, 25}
+
+
+def test_grouped_invalid_blocks_respect_group_block_sizes():
+    """Mixed block sizes should truncate by token position, not group index."""
+
+    class DummyRequest:
+        def __init__(self):
+            self.request_id = "req-hetero"
+            self.num_computed_tokens = 96
+            self.num_external_computed_tokens = 96
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.kv_cache_config = Mock()
+    scheduler.kv_cache_config.kv_cache_groups = (
+        Mock(kv_cache_spec=Mock(block_size=16)),
+        Mock(kv_cache_spec=Mock(block_size=32)),
+    )
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [10, 11, 12, 13, 14, 15],
+        [20, 21, 22],
+    )
+
+    request = DummyRequest()
+    affected_req_ids, total_affected_tokens, blocks_to_evict = (
+        Scheduler._update_requests_with_invalid_blocks(
+            scheduler,
+            [request],
+            {13},
+            {},
+            evict_blocks=True,
+        )
+    )
+
+    assert affected_req_ids == {"req-hetero"}
+    assert request.num_computed_tokens == 48
+    assert request.num_external_computed_tokens == 48
+    assert total_affected_tokens == 48
+    assert blocks_to_evict == {13, 14, 15, 22}
+
+
 def test_async_recompute_blocks_not_cached_when_invalid(
     recompute_scheduler: Scheduler,
 ):

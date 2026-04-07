@@ -241,6 +241,40 @@ class TestUpdateConnectorOutput:
 
         assert mock_connector._kv_cache_events is kv_events
 
+
+class TestSupportsHMA:
+
+    def test_latest_adapter_supports_hma(self):
+        assert LMCacheConnectorV1.supports_hma_for_config({}) is True
+
+    def test_vendored_native_adapter_disables_hma(self):
+        assert LMCacheConnectorV1.supports_hma_for_config({
+            "use_native": True
+        }) is False
+
+
+class TestRequestFinishedAllGroups:
+
+    def test_delegates_grouped_finish_to_lmcache_engine(self, mock_connector):
+        request = MagicMock()
+        block_ids = ([1, 2], [11, 12])
+        mock_connector._lmcache_engine.request_finished_all_groups.return_value = (
+            False,
+            {"ok": True},
+        )
+
+        result = LMCacheConnectorV1.request_finished_all_groups(
+            mock_connector,
+            request,
+            block_ids,
+        )
+
+        assert result == (False, {"ok": True})
+        mock_connector._lmcache_engine.request_finished_all_groups.assert_called_once_with(
+            request,
+            block_ids,
+        )
+
     def test_adds_events_when_kv_cache_events_already_exists(self, mock_connector):
         """Test that events are added when _kv_cache_events already exists."""
         # Set up existing events

@@ -1324,25 +1324,36 @@ class Gemma4Model(nn.Module):
                 ) in expert_params_mapping:
                     if weight_name not in name:
                         continue
-                    moe_name = name.replace(weight_name, param_name)
+
+                    # Determine suffix after proj name for NVFP4 scale support
+                    suffix_start = name.find(weight_name) + len(weight_name)
+                    suffix = name[suffix_start:]
+
+                    if suffix in ("", ".weight"):
+                        moe_name = name.replace(weight_name + suffix, param_name)
+                        wl_name = weight_name + ".weight"
+                    elif suffix == ".weight_scale":
+                        moe_name = name.replace(weight_name + suffix, param_name + "_scale")
+                        wl_name = weight_name + ".weight_scale"
+                    elif suffix == ".weight_scale_2":
+                        moe_name = name.replace(weight_name + suffix, param_name + "_scale_2")
+                        wl_name = weight_name + ".weight_scale_2"
+                    elif suffix == ".input_scale":
+                        moe_name = name.replace(weight_name + suffix, param_name.replace("weight", "input_scale"))
+                        wl_name = weight_name + ".input_scale"
+                    else:
+                        continue
+
                     if moe_name not in params_dict:
                         continue
                     if is_pp_missing_parameter(moe_name, self):
                         continue
                     param = params_dict[moe_name]
-                    # Expert weights are already in the correct
-                    # orientation for FusedMoE after _weight_iterator:
-                    #   gate/up: [I, H] → w1/w3 expects [I, H]
-                    #   down:    [H, I] → w2 expects [H, I]
-                    assert loaded_weight.dim() == 2, (
-                        f"Expected 2D expert weight for {weight_name}, "
-                        f"got shape {loaded_weight.shape}"
-                    )
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
                         loaded_weight,
-                        weight_name + ".weight",
+                        wl_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
@@ -1356,10 +1367,18 @@ class Gemma4Model(nn.Module):
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # If this is a FusedMoE param that fell through, skip it
+                    # rather than calling weight_loader without required args
+                    import inspect
+                    sig = inspect.signature(weight_loader)
+                    if len(sig.parameters) > 3 and "expert_id" in sig.parameters:
+                        continue
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 

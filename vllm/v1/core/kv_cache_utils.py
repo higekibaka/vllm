@@ -1299,7 +1299,7 @@ def _report_kv_cache_config(
     )
 
     # Log the KV cache size and maximum concurrency.
-    num_tokens = (
+    raw_num_tokens = (
         kv_cache_config.num_blocks
         // len(kv_cache_config.kv_cache_groups)
         * min_block_size
@@ -1307,7 +1307,7 @@ def _report_kv_cache_config(
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     if pcp_size * dcp_size > 1:
-        num_tokens *= pcp_size * dcp_size
+        raw_num_tokens *= pcp_size * dcp_size
         logger.info(
             "Multiplying the GPU KV cache size by the cp_world_size %d "
             "(pcp_world_size %d * dcp_world_size %d).",
@@ -1315,12 +1315,36 @@ def _report_kv_cache_config(
             pcp_size,
             dcp_size,
         )
-    num_tokens_str = f"{num_tokens:,}"
-    logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
+    has_windowed_attention = any(
+        (
+            isinstance(group.kv_cache_spec, SlidingWindowSpec)
+            or isinstance(group.kv_cache_spec, ChunkedLocalAttentionSpec)
+            or getattr(group.kv_cache_spec, "sliding_window", None) is not None
+            or getattr(group.kv_cache_spec, "attention_chunk_size", None) is not None
+        )
+        for group in kv_cache_config.kv_cache_groups
+    )
+    if has_windowed_attention:
+        effective_num_tokens = int(
+            max_concurrency * vllm_config.model_config.max_model_len
+        )
+        logger.info_once(
+            "GPU KV cache size (effective with hybrid/sliding-window "
+            "attention): %s tokens (raw block capacity: %s tokens)",
+            f"{effective_num_tokens:,}",
+            f"{raw_num_tokens:,}",
+            scope="local",
+        )
+    else:
+        logger.info_once(
+            "GPU KV cache size: %s tokens",
+            f"{raw_num_tokens:,}",
+            scope="local",
+        )
     logger.info_once(
         "Maximum concurrency for %s tokens per request: %.2fx",
         max_model_len_str,

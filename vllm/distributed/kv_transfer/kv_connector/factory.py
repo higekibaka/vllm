@@ -55,11 +55,26 @@ class KVConnectorFactory:
 
         # check if the connector supports HMA
         hma_enabled = not config.scheduler_config.disable_hybrid_kv_cache_manager
-        if hma_enabled and not supports_hma(connector_cls):
-            raise ValueError(
-                f"Connector {connector_cls.__name__} does not support HMA but "
-                f"HMA is enabled. Please set `--disable-hybrid-kv-cache-manager`."
-            )
+        if hma_enabled:
+            connector_supports_hma = supports_hma(connector_cls)
+            if connector_supports_hma:
+                supports_hma_for_config = getattr(
+                    connector_cls,
+                    "supports_hma_for_config",
+                    None,
+                )
+                if callable(supports_hma_for_config):
+                    connector_supports_hma = bool(
+                        supports_hma_for_config(
+                            kv_transfer_config.kv_connector_extra_config
+                        )
+                    )
+            if not connector_supports_hma:
+                raise ValueError(
+                    f"Connector {connector_cls.__name__} does not support HMA for "
+                    "the current configuration. Please set "
+                    "`--disable-hybrid-kv-cache-manager`."
+                )
 
         logger.info(
             "Creating v1 connector with name: %s and engine_id: %s",
