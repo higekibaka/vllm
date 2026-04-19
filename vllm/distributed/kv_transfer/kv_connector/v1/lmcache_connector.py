@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -69,7 +71,11 @@ class LMCacheKVEvents(KVConnectorKVEvents):
         return f"<LMCacheKVEvents events={self.get_all_events()}>"
 
 
-class LMCacheConnectorV1(KVConnectorBase_V1):
+class LMCacheConnectorV1(KVConnectorBase_V1, SupportsHMA):
+    @classmethod
+    def supports_hma_for_config(cls, extra_config: dict[str, Any]) -> bool:
+        return True
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -110,7 +116,25 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
             cls = LMCacheConnectorLatestImpl
 
-        self._lmcache_engine = cls(vllm_config, role, self)
+        constructor_signature = inspect.signature(cls)
+        constructor_params = constructor_signature.parameters
+        accepts_kv_cache_config = "kv_cache_config" in constructor_params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in constructor_params.values()
+        )
+        hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        if hma_enabled and not accepts_kv_cache_config:
+            raise ValueError(
+                "The installed LMCache adapter does not accept kv_cache_config, "
+                "which is required for HMA. Please upgrade LMCache or set "
+                "`--disable-hybrid-kv-cache-manager`."
+            )
+        if accepts_kv_cache_config:
+            self._lmcache_engine = cls(
+                vllm_config, role, self, kv_cache_config=kv_cache_config
+            )
+        else:
+            self._lmcache_engine = cls(vllm_config, role, self)
 
         self._kv_cache_events: LMCacheKVEvents | None = None
 
@@ -338,6 +362,18 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if hasattr(self._lmcache_engine, "request_finished_all_groups"):
+            return self._lmcache_engine.request_finished_all_groups(request, block_ids)
+        flattened_block_ids = [
+            block_id for group_block_ids in block_ids for block_id in group_block_ids
+        ]
+        return self._lmcache_engine.request_finished(request, flattened_block_ids)
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """

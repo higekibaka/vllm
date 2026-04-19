@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+import inspect
 import os
 import uuid
 from collections.abc import Generator
@@ -54,6 +55,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -62,6 +64,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -117,6 +120,53 @@ def extract_request_configs(sampling_params: SamplingParams) -> dict | None:
     return request_configs
 
 
+def _normalize_block_ids(
+    block_ids: tuple[list[int], ...] | list[int] | tuple[Any, ...] | None,
+) -> tuple[list[int], ...]:
+    if block_ids is None:
+        return tuple()
+    if isinstance(block_ids, tuple):
+        if len(block_ids) == 0:
+            return tuple()
+        if isinstance(block_ids[0], (list, tuple)):
+            return tuple(list(group) for group in block_ids)
+        return (list(block_ids),)
+    if isinstance(block_ids, list):
+        if len(block_ids) == 0:
+            return tuple()
+        if isinstance(block_ids[0], list):
+            return tuple(list(group) for group in block_ids)
+        return (list(block_ids),)
+    raise ValueError(f"Unsupported block_ids type {type(block_ids)}")
+
+
+def _compute_group_block_sizes(
+    num_groups: int,
+    fallback_block_size: int,
+    kv_cache_groups: list[Any] | tuple[Any, ...] | None = None,
+) -> tuple[int, ...]:
+    group_block_sizes: list[int] = []
+    for gid in range(num_groups):
+        group_block_size = fallback_block_size
+        if kv_cache_groups is not None and gid < len(kv_cache_groups):
+            group_block_size = kv_cache_groups[gid].kv_cache_spec.block_size
+        group_block_sizes.append(group_block_size)
+    return tuple(group_block_sizes)
+
+
+def _compute_max_token_slots(
+    block_ids_by_group: tuple[list[int], ...],
+    group_block_sizes: tuple[int, ...],
+) -> int:
+    return max(
+        (
+            len(block_ids_for_group) * group_block_sizes[gid]
+            for gid, block_ids_for_group in enumerate(block_ids_by_group)
+        ),
+        default=0,
+    )
+
+
 @dataclass
 class RequestTracker:
     # Request id
@@ -128,9 +178,9 @@ class RequestTracker:
     # The token ids that has been scheduled so far
     token_ids: list[int]
 
-    # The block ids that has been allocated so far
-    # NOTE: allocated blocks could be more than the number of tokens
-    allocated_block_ids: list[int]
+    # The block ids that have been allocated so far, grouped by KV cache group.
+    # NOTE: allocated blocks could be more than the number of tokens.
+    allocated_block_ids_by_group: tuple[list[int], ...]
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -150,6 +200,19 @@ class RequestTracker:
 
     # Whether the request cache should be saved
     skip_save: bool = False
+
+    @property
+    def allocated_block_ids(self) -> list[int]:
+        """Return group 0 blocks for legacy single-group callers."""
+        if not self.allocated_block_ids_by_group:
+            return []
+        return self.allocated_block_ids_by_group[0]
+
+    @property
+    def num_allocated_blocks(self) -> int:
+        if not self.allocated_block_ids_by_group:
+            return 0
+        return max(len(group) for group in self.allocated_block_ids_by_group)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -172,20 +235,7 @@ class RequestTracker:
                 cached in LMCache.
             skip_save (bool): whether the request cache should be saved
         """
-        # vLLM 0.9.0 update: request.block_ids changed from list[int] to
-        # list[list[int]]
-        # Need to check the type of request.block_ids
-
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+        block_ids_by_group = _normalize_block_ids(new_request.block_ids)
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -202,7 +252,7 @@ class RequestTracker:
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
-            allocated_block_ids=unfolded_block_ids,
+            allocated_block_ids_by_group=block_ids_by_group,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -222,22 +272,27 @@ class RequestTracker:
 
         self.token_ids.extend(new_token_ids)
 
-        if new_block_ids is None:
-            # https://github.com/vllm-project/vllm/commit/
-            # b029de9902aa3ac58806c8c17776c7074175b6db
-            new_block_ids = []
-        elif len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported new_block_ids type {type(new_block_ids)}: "
-                f"should be None[list[int], ...], tuple or list[int]."
-            )
-        self.allocated_block_ids.extend(new_block_ids)
+        new_block_ids_by_group = _normalize_block_ids(new_block_ids)
+        if new_block_ids_by_group:
+            if not self.allocated_block_ids_by_group:
+                self.allocated_block_ids_by_group = new_block_ids_by_group
+            elif len(self.allocated_block_ids_by_group) != len(
+                new_block_ids_by_group
+            ):
+                raise ValueError(
+                    "Mismatched KV cache group count for request "
+                    f"{self.req_id}: had {len(self.allocated_block_ids_by_group)}, "
+                    f"got {len(new_block_ids_by_group)}"
+                )
+            else:
+                self.allocated_block_ids_by_group = tuple(
+                    old + new
+                    for old, new in zip(
+                        self.allocated_block_ids_by_group,
+                        new_block_ids_by_group,
+                        strict=True,
+                    )
+                )
 
         # When a request is scheduled again, and the number of new tokens
         # is 1 (excluding chunked prefill), the request is in decode phase.
@@ -251,8 +306,15 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
+    # Request block IDs grouped by KV cache group.
+    block_ids_by_group: tuple[list[int], ...] | None = None
     # Slot mapping
-    slot_mapping: torch.Tensor
+    slot_mapping: torch.Tensor = field(
+        default_factory=lambda: torch.empty((0,), dtype=torch.long)
+    )
+    # Slot mappings grouped by KV cache group and by layer.
+    slot_mappings_by_group: tuple[torch.Tensor, ...] | None = None
+    slot_mappings_by_layer: dict[str, torch.Tensor] | None = None
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -274,6 +336,7 @@ class ReqMeta:
         load_spec: LoadSpec | None = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        kv_cache_groups: list[Any] | tuple[Any, ...] | None = None,
     ) -> "ReqMeta | None":
         """Create the request metadata from a request tracker.
 
@@ -284,6 +347,8 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            kv_cache_groups: KV cache groups used to derive per-group block
+                sizes and per-layer slot mappings under HMA.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -351,29 +416,77 @@ class ReqMeta:
             )
             token_ids = token_ids_tensor.tolist()
 
-        num_blocks = len(tracker.allocated_block_ids)
-
-        if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks."
-                "Something might be wrong in scheduling logic!"
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
-                len(token_ids),
-                num_blocks,
-                block_size,
-            )
-
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
+        group_block_sizes = _compute_group_block_sizes(
+            num_groups=len(tracker.allocated_block_ids_by_group),
+            fallback_block_size=block_size,
+            kv_cache_groups=kv_cache_groups,
+        )
+        max_num_token_slots = _compute_max_token_slots(
+            tracker.allocated_block_ids_by_group,
+            group_block_sizes,
         )
 
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
-        assert slot_mapping.dtype == torch.long
+        if len(token_ids) > max_num_token_slots:
+            logger.error(
+                "The number of tokens is more than the number of blocks "
+                "for request %s. Something might be wrong in scheduling logic!",
+                tracker.req_id,
+            )
+            logger.error(
+                "Num tokens: %d, max token slots: %d, group block sizes: %s",
+                len(token_ids),
+                max_num_token_slots,
+                group_block_sizes,
+            )
+
+        slot_mappings_by_group: dict[int, torch.Tensor] = {}
+        for gid, block_ids_for_group in enumerate(tracker.allocated_block_ids_by_group):
+            group_block_size = group_block_sizes[gid]
+            group_num_blocks = len(block_ids_for_group)
+            block_ids = torch.tensor(block_ids_for_group, dtype=torch.long)
+            block_offsets = torch.arange(0, group_block_size, dtype=torch.long)
+            slot_mapping = (
+                block_offsets.reshape((1, group_block_size))
+                + (
+                    block_ids.reshape((group_num_blocks, 1)).clamp_min(0)
+                    * group_block_size
+                )
+            )
+            null_block_mask = block_ids.eq(NULL_BLOCK_ID).reshape(
+                (group_num_blocks, 1)
+            )
+            if null_block_mask.any():
+                slot_mapping = slot_mapping.masked_fill(null_block_mask, -1)
+            slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+            assert slot_mapping.dtype == torch.long
+            if slot_mapping.shape[0] < len(token_ids):
+                logger.warning(
+                    "Request %s group %d slot mapping only covers %d / %d "
+                    "tokens (group block size=%d, num blocks=%d).",
+                    tracker.req_id,
+                    gid,
+                    slot_mapping.shape[0],
+                    len(token_ids),
+                    group_block_size,
+                    group_num_blocks,
+                )
+            slot_mappings_by_group[gid] = slot_mapping
+
+        slot_mapping = (
+            max(
+                slot_mappings_by_group.values(),
+                key=lambda mapping: mapping.shape[0],
+            )
+            if slot_mappings_by_group
+            else torch.empty((0,), dtype=torch.long)
+        )
+
+        slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+        if kv_cache_groups is not None:
+            for gid, kv_cache_group in enumerate(kv_cache_groups):
+                group_slot_mapping = slot_mappings_by_group.get(gid, slot_mapping)
+                for layer_name in kv_cache_group.layer_names:
+                    slot_mappings_by_layer[layer_name] = group_slot_mapping
 
         # For load operation: check whether the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -389,7 +502,20 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
+            block_ids_by_group=tuple(
+                list(block_ids)
+                for block_ids in tracker.allocated_block_ids_by_group
+            ),
             slot_mapping=slot_mapping,
+            slot_mappings_by_group=(
+                tuple(
+                    slot_mappings_by_group[gid]
+                    for gid in sorted(slot_mappings_by_group.keys())
+                )
+                if slot_mappings_by_group
+                else None
+            ),
+            slot_mappings_by_layer=slot_mappings_by_layer or None,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
             load_spec=load_spec,
@@ -573,10 +699,14 @@ class LMCacheConnectorV1Impl:
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         assert vllm_config.kv_transfer_config is not None
         self._parent = parent
         self._vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config or getattr(
+            parent, "_kv_cache_config", None
+        )
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.worker_count = vllm_config.parallel_config.tensor_parallel_size
         config = lmcache_get_or_create_config()
@@ -658,6 +788,8 @@ class LMCacheConnectorV1Impl:
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
 
+        self._invalid_block_ids: set[int] = set()
+
         # Whether to discard partial chunks
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -713,6 +845,95 @@ class LMCacheConnectorV1Impl:
             VLLM_VERSION,
             getattr(self.lmcache_engine, "metadata", None),
         )
+
+    def _get_group_block_sizes(self, num_groups: int | None = None) -> tuple[int, ...]:
+        kv_cache_groups = getattr(self.kv_cache_config, "kv_cache_groups", None) or []
+        if num_groups is None:
+            num_groups = len(kv_cache_groups)
+        return _compute_group_block_sizes(
+            num_groups=num_groups,
+            fallback_block_size=self._block_size,
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    def _get_max_token_slots(
+        self, block_ids_by_group: tuple[list[int], ...]
+    ) -> int:
+        group_block_sizes = self._get_group_block_sizes(len(block_ids_by_group))
+        return _compute_max_token_slots(block_ids_by_group, group_block_sizes)
+
+    def _resolve_full_slot_mapping(self, request: ReqMeta) -> torch.Tensor:
+        token_count = len(request.token_ids)
+        slot_mapping = request.slot_mapping
+        if slot_mapping.shape[0] >= token_count:
+            return slot_mapping[:token_count]
+
+        candidate_mappings: list[torch.Tensor] = []
+        if request.slot_mappings_by_group is not None:
+            candidate_mappings.extend(request.slot_mappings_by_group)
+        if request.slot_mappings_by_layer is not None:
+            candidate_mappings.extend(request.slot_mappings_by_layer.values())
+
+        if candidate_mappings:
+            slot_mapping = max(candidate_mappings, key=lambda mapping: mapping.shape[0])
+
+        if slot_mapping.shape[0] < token_count:
+            raise ValueError(
+                "No slot mapping fully covers request "
+                f"{request.req_id}: token_count={token_count}, "
+                f"max_slot_mapping={slot_mapping.shape[0]}"
+            )
+
+        return slot_mapping[:token_count]
+
+    @staticmethod
+    def _supports_kwargs(fn: Any, *kwargs: str) -> bool:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return True
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            return True
+        return all(kwarg in signature.parameters for kwarg in kwargs)
+
+    def _layer_slot_mappings(
+        self,
+        request: ReqMeta,
+        *,
+        token_limit: int | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        if request.slot_mappings_by_layer is None:
+            return None
+
+        slot_mappings = {}
+        for layer_name, mapping in request.slot_mappings_by_layer.items():
+            if token_limit is not None:
+                mapping = mapping[:token_limit]
+            slot_mappings[layer_name] = mapping.cuda()
+        return slot_mappings
+
+    def _slot_mappings_kwargs(
+        self,
+        fn: Any,
+        request: ReqMeta,
+        slot_mappings: dict[str, torch.Tensor] | None,
+    ) -> dict[str, dict[str, torch.Tensor] | None]:
+        if self._supports_kwargs(fn, "slot_mappings"):
+            return {"slot_mappings": slot_mappings}
+        if (
+            slot_mappings is not None
+            and request.slot_mappings_by_group is not None
+            and len(request.slot_mappings_by_group) > 1
+        ):
+            raise RuntimeError(
+                "The installed LMCache engine does not accept per-layer "
+                "slot_mappings, which are required for HMA with multiple KV "
+                "cache groups."
+            )
+        return {}
 
     def get_inference_info(self) -> dict:
         """Get inference information including vLLM config and related details.
@@ -839,7 +1060,7 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.cuda()
+            slot_mapping = self._resolve_full_slot_mapping(request).cuda()
             assert len(tokens) == len(slot_mapping)
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -854,38 +1075,79 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            slot_mappings = self._layer_slot_mappings(
+                request, token_limit=lmcache_cached_tokens
+            )
             if self.use_layerwise:
                 sync = idx == last_idx
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending
                     # compatible
+                    blend_kwargs = self._slot_mappings_kwargs(
+                        self.blender.blend, request, slot_mappings
+                    )
+                    if self._supports_kwargs(
+                        self.blender.blend, "vllm_cached_tokens"
+                    ):
+                        blend_kwargs["vllm_cached_tokens"] = (
+                            request.load_spec.vllm_cached_tokens
+                        )
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        **blend_kwargs,
                     )
                 else:
+                    retrieve_layer_kwargs = {"sync": sync}
+                    retrieve_layer_kwargs.update(
+                        self._slot_mappings_kwargs(
+                            self.lmcache_engine.retrieve_layer,
+                            request,
+                            slot_mappings,
+                        )
+                    )
+                    if self._supports_kwargs(
+                        self.lmcache_engine.retrieve_layer, "vllm_cached_tokens"
+                    ):
+                        retrieve_layer_kwargs["vllm_cached_tokens"] = (
+                            request.load_spec.vllm_cached_tokens
+                        )
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        sync=sync,
+                        **retrieve_layer_kwargs,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                retrieve_kwargs = {
+                    "request_configs": request.request_configs,
+                    "req_id": request.req_id,
+                }
+                retrieve_kwargs.update(
+                    self._slot_mappings_kwargs(
+                        self.lmcache_engine.retrieve, request, slot_mappings
+                    )
+                )
+                if self._supports_kwargs(
+                    self.lmcache_engine.retrieve, "vllm_cached_tokens"
+                ):
+                    retrieve_kwargs["vllm_cached_tokens"] = (
+                        request.load_spec.vllm_cached_tokens
+                    )
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
+                    **retrieve_kwargs,
                 )
 
                 # Check the result
@@ -903,6 +1165,110 @@ class LMCacheConnectorV1Impl:
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
+                    missing_blocks = self.record_failed_blocks(
+                        request.req_id,
+                        token_mask[:lmcache_cached_tokens],
+                        ret_token_mask,
+                        slot_mapping[:lmcache_cached_tokens],
+                        request.slot_mappings_by_group,
+                        request.block_ids_by_group,
+                    )
+                    self._invalid_block_ids.update(missing_blocks)
+
+    def record_failed_blocks(
+        self,
+        request_id: str,
+        expected_mask: torch.Tensor,
+        ret_mask: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        slot_mappings_by_group: tuple[torch.Tensor, ...] | None = None,
+        block_ids_by_group: tuple[list[int], ...] | None = None,
+    ) -> set[int]:
+        """Record block IDs associated with failed LMCache load attempts."""
+        if expected_mask.numel() == 0:
+            return set()
+
+        expected_mask_cpu = expected_mask.to(device="cpu", dtype=torch.bool)
+        ret_mask_cpu = ret_mask.to(device="cpu", dtype=torch.bool)
+        if ret_mask_cpu.shape[0] != expected_mask_cpu.shape[0]:
+            logger.debug("expected_mask and ret_mask have different lengths")
+            return set()
+
+        missing_mask = expected_mask_cpu & ~ret_mask_cpu
+        if not torch.any(missing_mask):
+            return set()
+
+        missing_indices = torch.nonzero(missing_mask, as_tuple=False).view(-1)
+        if missing_indices.numel() == 0:
+            return set()
+
+        missing_blocks: set[int] = set()
+        first_failed_token_idx = int(missing_indices[0].item())
+
+        if block_ids_by_group is not None:
+            group_block_sizes = self._get_group_block_sizes(len(block_ids_by_group))
+            for gid, group_block_ids in enumerate(block_ids_by_group):
+                if not group_block_ids:
+                    continue
+                group_block_size = (
+                    group_block_sizes[gid]
+                    if gid < len(group_block_sizes)
+                    else self._block_size
+                )
+                group_start_idx = first_failed_token_idx // group_block_size
+                if group_start_idx >= len(group_block_ids):
+                    continue
+                missing_blocks.update(
+                    block_id
+                    for block_id in group_block_ids[group_start_idx:]
+                    if block_id > NULL_BLOCK_ID
+                )
+        else:
+            mapping_tensors = slot_mappings_by_group or (slot_mapping,)
+            group_block_sizes = self._get_group_block_sizes(len(mapping_tensors))
+
+            for gid, mapping in enumerate(mapping_tensors):
+                slot_mapping_cpu = mapping.to(device="cpu", dtype=torch.long)
+                if slot_mapping_cpu.shape[0] > missing_mask.shape[0]:
+                    slot_mapping_cpu = slot_mapping_cpu[: missing_mask.shape[0]]
+                valid_missing_indices = missing_indices[
+                    missing_indices < slot_mapping_cpu.shape[0]
+                ]
+                if valid_missing_indices.numel() == 0:
+                    logger.warning(
+                        "Request %s group %d slot mapping is shorter than "
+                        "all failed token indices (%d < %d); skipping this "
+                        "group for invalid block reporting.",
+                        request_id,
+                        gid,
+                        slot_mapping_cpu.shape[0],
+                        int(missing_indices.max().item()) + 1,
+                    )
+                    continue
+                valid_slots = slot_mapping_cpu[valid_missing_indices]
+                valid_slots = valid_slots[valid_slots >= 0]
+                if valid_slots.numel() == 0:
+                    continue
+                group_block_size = (
+                    group_block_sizes[gid]
+                    if gid < len(group_block_sizes)
+                    else self._block_size
+                )
+                missing_blocks_tensor = torch.unique(valid_slots // group_block_size)
+                missing_blocks.update(
+                    int(block.item()) for block in missing_blocks_tensor
+                )
+
+        if missing_blocks:
+            logger.warning(
+                "Request %s failed to load %d tokens from token %d onward "
+                "across %d blocks",
+                request_id,
+                missing_indices.numel(),
+                first_failed_token_idx,
+                len(missing_blocks),
+            )
+        return missing_blocks
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -977,9 +1343,10 @@ class LMCacheConnectorV1Impl:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
 
-                slot_mapping = request.slot_mapping
+                slot_mapping = self._resolve_full_slot_mapping(request)
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
+                slot_mappings = self._layer_slot_mappings(request)
 
                 # TODO: have a pre-allocated buffer to hold the slot_mappings
                 slot_mapping = slot_mapping.cuda()
@@ -1012,13 +1379,21 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
+                store_layer_kwargs = {"sync": is_first}
+                store_layer_kwargs.update(
+                    self._slot_mappings_kwargs(
+                        self.lmcache_engine.store_layer,
+                        request,
+                        slot_mappings,
+                    )
+                )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
-                    sync=is_first,
+                    **store_layer_kwargs,
                 )
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
@@ -1063,10 +1438,11 @@ class LMCacheConnectorV1Impl:
 
             token_ids = request.token_ids
 
-            slot_mapping = request.slot_mapping
+            slot_mapping = self._resolve_full_slot_mapping(request)
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
             assert save_spec is not None
+            slot_mappings = self._layer_slot_mappings(request)
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = slot_mapping.cuda()
@@ -1111,15 +1487,28 @@ class LMCacheConnectorV1Impl:
                 token_ids = token_ids[:aligned_token_len]
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
+                if slot_mappings is not None:
+                    slot_mappings = {
+                        layer_name: mapping[:aligned_token_len]
+                        for layer_name, mapping in slot_mappings.items()
+                    }
 
+            store_kwargs = {
+                "transfer_spec": request.disagg_spec,
+                "request_configs": request.request_configs,
+            }
+            store_kwargs.update(
+                self._slot_mappings_kwargs(
+                    self.lmcache_engine.store, request, slot_mappings
+                )
+            )
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
                 offset=skip_leading_tokens,
-                transfer_spec=request.disagg_spec,
-                request_configs=request.request_configs,
+                **store_kwargs,
             )
 
             # NOTE(Jiayi): We assume all tokens are saved
@@ -1132,6 +1521,11 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         return None, None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid_blocks = self._invalid_block_ids.copy()
+        self._invalid_block_ids.clear()
+        return invalid_blocks
 
     ###################
     # Scheduler side APIs
@@ -1309,6 +1703,7 @@ class LMCacheConnectorV1Impl:
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
+        kv_cache_groups = getattr(self.kv_cache_config, "kv_cache_groups", None)
 
         # set and update lookup requests for unpin
         meta.lookup_requests_in_step = self._lookup_requests_in_step
@@ -1351,6 +1746,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self._save_decode_cache,
+                kv_cache_groups=kv_cache_groups,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -1371,6 +1767,7 @@ class LMCacheConnectorV1Impl:
                     self._lmcache_chunk_size,
                     load_spec=None,
                     discard_partial_chunks=self._discard_partial_chunks,
+                    kv_cache_groups=kv_cache_groups,
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
@@ -1400,6 +1797,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=None,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self._save_decode_cache,
+                kv_cache_groups=kv_cache_groups,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -1427,3 +1825,14 @@ class LMCacheConnectorV1Impl:
             }
 
         return False, return_params
+
+    @_lmcache_nvtx_annotate
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        flattened_block_ids = [
+            block_id for group_block_ids in block_ids for block_id in group_block_ids
+        ]
+        return self.request_finished(request, flattened_block_ids)

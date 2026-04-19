@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.base import supports_hma
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
@@ -240,6 +241,56 @@ class TestUpdateConnectorOutput:
         mock_connector.update_connector_output(connector_output)
 
         assert mock_connector._kv_cache_events is kv_events
+
+
+class TestSupportsHMA:
+
+    def test_lmcache_connector_supports_hma(self):
+        assert supports_hma(LMCacheConnectorV1)
+        assert LMCacheConnectorV1.supports_hma_for_config({}) is True
+        assert LMCacheConnectorV1.supports_hma_for_config({"use_native": True}) is True
+
+
+class TestRequestFinishedAllGroups:
+
+    def test_delegates_grouped_finish_to_lmcache_engine(self, mock_connector):
+        request = MagicMock()
+        block_ids = ([1, 2], [11, 12])
+        mock_connector._lmcache_engine.request_finished_all_groups.return_value = (
+            False,
+            {"ok": True},
+        )
+
+        result = LMCacheConnectorV1.request_finished_all_groups(
+            mock_connector,
+            request,
+            block_ids,
+        )
+
+        assert result == (False, {"ok": True})
+        mock_connector._lmcache_engine.request_finished_all_groups.assert_called_once_with(
+            request,
+            block_ids,
+        )
+
+    def test_flattens_grouped_finish_for_legacy_lmcache_engine(self, mock_connector):
+        request = MagicMock()
+        block_ids = ([1, 2], [11, 12])
+        legacy_engine = MagicMock(spec=["request_finished", "get_kv_events"])
+        legacy_engine.request_finished.return_value = (False, {"legacy": True})
+        mock_connector._lmcache_engine = legacy_engine
+
+        result = LMCacheConnectorV1.request_finished_all_groups(
+            mock_connector,
+            request,
+            block_ids,
+        )
+
+        assert result == (False, {"legacy": True})
+        legacy_engine.request_finished.assert_called_once_with(request, [1, 2, 11, 12])
+
+
+class TestUpdateConnectorOutputMore:
 
     def test_adds_events_when_kv_cache_events_already_exists(self, mock_connector):
         """Test that events are added when _kv_cache_events already exists."""

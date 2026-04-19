@@ -1287,20 +1287,69 @@ class VllmConfig:
                 need_disable_hybrid_kv_cache_manager = True
 
         if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
-            # Default to disable HMA, but only if the user didn't express a preference.
-            if self.kv_transfer_config is not None:
-                # NOTE(Kuntai): turn HMA off for connector unless specifically enabled.
-                need_disable_hybrid_kv_cache_manager = True
-                logger.warning(
-                    "Turning off hybrid kv cache manager because "
-                    "`--kv-transfer-config` is set. This will reduce the "
-                    "performance of vLLM on LLMs with sliding window attention "
-                    "or Mamba attention. If you are a developer of kv connector"
-                    ", please consider supporting hybrid kv cache manager for "
-                    "your connector by making sure your connector is a subclass"
-                    " of `SupportsHMA` defined in kv_connector/v1/base.py and"
-                    " use --no-disable-hybrid-kv-cache-manager to start vLLM."
-                )
+            # Default to disable HMA only for connectors that do not advertise
+            # HMA support.
+            if (
+                self.kv_transfer_config is not None
+                and not need_disable_hybrid_kv_cache_manager
+            ):
+                connector_cls = None
+                connector_supports_hma = False
+                connector_resolution_error: Exception | None = None
+                try:
+                    from vllm.distributed.kv_transfer.kv_connector.factory import (
+                        KVConnectorFactory,
+                    )
+                    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+                        supports_hma,
+                    )
+
+                    connector_cls = KVConnectorFactory.get_connector_class(
+                        self.kv_transfer_config
+                    )
+                    connector_supports_hma = supports_hma(connector_cls)
+                    if connector_supports_hma:
+                        supports_hma_for_config = getattr(
+                            connector_cls,
+                            "supports_hma_for_config",
+                            None,
+                        )
+                        if callable(supports_hma_for_config):
+                            connector_supports_hma = bool(
+                                supports_hma_for_config(
+                                    self.kv_transfer_config.kv_connector_extra_config
+                                )
+                            )
+                except Exception as e:
+                    connector_resolution_error = e
+
+                if connector_supports_hma:
+                    logger.info(
+                        "Keeping hybrid kv cache manager enabled because "
+                        "connector %s supports HMA.",
+                        connector_cls.__name__ if connector_cls else "<unknown>",
+                    )
+                else:
+                    need_disable_hybrid_kv_cache_manager = True
+                    if connector_resolution_error is not None:
+                        logger.warning(
+                            "Turning off hybrid kv cache manager because "
+                            "`--kv-transfer-config` is set and connector "
+                            "capabilities could not be resolved (%s).",
+                            connector_resolution_error,
+                        )
+                    else:
+                        logger.warning(
+                            "Turning off hybrid kv cache manager because "
+                            "`--kv-transfer-config` is set. This will reduce the "
+                            "performance of vLLM on LLMs with sliding window "
+                            "attention or Mamba attention. If you are a "
+                            "developer of kv connector, please consider "
+                            "supporting hybrid kv cache manager for your "
+                            "connector by making sure your connector is a "
+                            "subclass of `SupportsHMA` defined in "
+                            "kv_connector/v1/base.py."
+                        )
             self.scheduler_config.disable_hybrid_kv_cache_manager = (
                 need_disable_hybrid_kv_cache_manager
             )
