@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import inspect
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -1362,11 +1363,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     if is_pp_missing_parameter(moe_name, self):
                         continue
                     param = params_dict[moe_name]
-                    # Expert weights are already in the correct
-                    # orientation for FusedMoE after _weight_iterator:
-                    #   gate/up: [I, H] → w1/w3 expects [I, H]
-                    #   down:    [H, I] → w2 expects [H, I]
-                    # Scales and other quantization params may be 1D or scalar.
+                    # Only actual expert matrices must be 2D here. Quantized
+                    # metadata like input_scale / weight_scale(_2) may be
+                    # scalar or 1D and are handled by FusedMoE's loader.
+                    if moe_name.endswith("_weight"):
+                        # Expert weights are already in the correct
+                        # orientation for FusedMoE after _weight_iterator:
+                        #   gate/up: [I, H] -> w1/w3 expects [I, H]
+                        #   down:    [H, I] -> w2 expects [H, I]
+                        assert loaded_weight.dim() == 2, (
+                            f"Expected 2D expert weight for {weight_name}, "
+                            f"got shape {loaded_weight.shape}"
+                        )
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1385,10 +1393,17 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # If this is a FusedMoE param that fell through, skip it
+                    # rather than calling weight_loader without required args.
+                    sig = inspect.signature(weight_loader)
+                    if len(sig.parameters) > 3 and "expert_id" in sig.parameters:
+                        continue
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
